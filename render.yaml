@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: lead-gen-ai
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: PUPPETEER_SKIP_DOWNLOAD
+        value: true
+      - key: PORT
+        value: 3000
+      - key: NEXT_PUBLIC_GEMINI_API_KEY
+        sync: false
+      - key: NEXT_PUBLIC_GEMINI_KEY_54
+        sync: false
+      - key: NEXT_PUBLIC_GEMINI_KEY_55
+        sync: false
+      - key: NEXT_PUBLIC_GEMINI_KEY_56
+        sync: false
+      - key: NEXT_PUBLIC_GEMINI_KEY_57
+        sync: false
+      - key: NEXT_PUBLIC_GEMINI_KEY_58
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false
+      - key: ZOOMINFO_CLIENT_ID
+        sync: false
+      - key: ZOOMINFO_CLIENT_SECRET
+        sync: false
+      - key: ZOOMINFO_MCP_SSE_URL
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: LINKEDIN_EMAIL
+        sync: false
+      - key: LINKEDIN_PASSWORD
+        sync: false
