@@ -22,7 +22,6 @@ export async function POST(req: Request) {
       const results = await lookupPeopleViaZoomInfo(cappedRows);
 
       const leads = results
-        .filter(r => r.status === 'found' || r.status === 'multiple_matches')
         .map(r => r.lead)
         .filter(Boolean);
 

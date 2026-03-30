@@ -359,6 +359,54 @@ function mapToLead(
   };
 }
 
+/** Builds a partial lead from raw CSV input when ZoomInfo has no match. */
+function mapCsvRowToPartialLead(row: CsvLookupRow, reason: string): Partial<Lead> {
+  return {
+    id: crypto.randomUUID(),
+    name: `${row.firstName} ${row.lastName}`.trim() || row.companyName,
+    firstName: row.firstName,
+    lastName: row.lastName,
+    title: row.designationTitle,
+    companyName: row.companyName,
+
+    // All ZoomInfo-sourced fields left empty — not available
+    email: '',
+    email2: '',
+    emailPersonal: '',
+    directPhone: '',
+    mobilePhone: '',
+    linkedinUrl: '',
+    managementLevel: '',
+    industry: '',
+    companyWebsite: '',
+    companyPhone: '',
+    companyDescription: '',
+    companyLinkedinUrl: '',
+    employeeCount: undefined,
+    revenueRange: '',
+    annualRevenue: '',
+
+    // Verification flags
+    isVerified: false,
+    verificationSource: 'CSV Input',
+    confidenceScore: 0,
+    urlStatus: 'Not_Found',
+    matchedSkills: [],
+    aiReasoning: reason,
+    signalTrustBridge: false,
+    signalFunctionalWedge: false,
+    signalAuthority: false,
+    influenceScore: 0,
+
+    // CRM fields
+    leadSourceGlobal: 'ZoomInfo MCP',
+    segmentName: '',
+    sdrName: '',
+    researcherName: '',
+    dataRequesterDetails: '',
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Search + Enrich Pipeline
 // ---------------------------------------------------------------------------
@@ -583,7 +631,18 @@ async function lookupPeopleViaZoomInfoInternal(
 
   for (const sr of searchResults) {
     if (!sr.bestMatch) {
-      results.push({ row: sr.row, status: sr.status, lead: null, errorMessage: sr.errorMessage, matchCount: sr.matchCount });
+      // Build a partial lead from CSV input so the row is never dropped
+      const reason = sr.status === 'error'
+        ? `ZoomInfo lookup error: ${sr.errorMessage ?? 'unknown'}`
+        : 'No match found in ZoomInfo database';
+      const partialLead = mapCsvRowToPartialLead(sr.row, reason);
+      results.push({
+        row: sr.row,
+        status: sr.status,
+        lead: partialLead,
+        errorMessage: sr.errorMessage,
+        matchCount: sr.matchCount ?? 0,
+      });
       continue;
     }
 
