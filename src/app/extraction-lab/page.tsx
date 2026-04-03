@@ -4,7 +4,7 @@
 
 "use client";
 
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   Zap,
   ShieldAlert,
@@ -64,6 +64,7 @@ export default function ExtractionLab() {
   // CSV Lookup State (ZoomInfo mode)
   const [csvRows, setCsvRows] = useState<CsvLookupRow[]>([]);
   const [lookupMeta, setLookupMeta] = useState<any>(null);
+  const csvLookupInFlight = useRef(false);
   
   // Target Identification State
   const [suggestedTitles, setSuggestedTitles] = useState<string[]>([]);
@@ -326,7 +327,8 @@ const handleLoadMoreProxies = async () => {
   };
 
   const handleCsvLookup = async () => {
-    if (csvRows.length === 0) return;
+    if (csvRows.length === 0 || csvLookupInFlight.current) return;
+    csvLookupInFlight.current = true;
 
     setProcessingStatus({ extractingLeads: true });
     setProgress(5);
@@ -370,6 +372,7 @@ const handleLoadMoreProxies = async () => {
       console.error('CSV lookup failed:', error);
       setProgress(0);
     } finally {
+      csvLookupInFlight.current = false;
       setProcessingStatus({ extractingLeads: false });
     }
   };
