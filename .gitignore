@@ -37,3 +37,6 @@ next-env.d.ts
 
 # puppeteer
 /chrome-data
+
+# internal docs
+ZOOMINFO_INTEGRATION_EXPLAINER.md

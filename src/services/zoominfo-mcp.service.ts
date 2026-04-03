@@ -13,6 +13,12 @@ let clientToken: string | null = null; // tracks which token the current client 
 // ZoomInfo's hosted MCP server endpoint (default)
 const ZOOMINFO_MCP_DEFAULT_URL = 'https://mcp.zoominfo.com/mcp';
 
+// ---------------------------------------------------------------------------
+// Company Enrichment Cache (30-minute TTL — company data changes slowly)
+// ---------------------------------------------------------------------------
+const COMPANY_CACHE_TTL_MS = 30 * 60 * 1000;
+const companyEnrichCache = new Map<string, { data: any; expiresAt: number }>();
+
 async function getClient(): Promise<Client> {
   const token = await getZoomInfoToken();
 
@@ -35,8 +41,7 @@ async function getClient(): Promise<Client> {
   clientToken = token;
   await mcpClient.connect(transport);
 
-  const tools = await mcpClient.listTools();
-  console.log('[ZoomInfo MCP] Connected. Available tools:', tools.tools.map(t => t.name));
+  console.log('[ZoomInfo MCP] Connected.');
 
   return mcpClient;
 }
@@ -45,6 +50,7 @@ function resetClient() {
   mcpClient = null;
   clientToken = null;
   validDepartmentsCache = null;
+  companyEnrichCache.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -225,8 +231,24 @@ async function enrichCompaniesBatch(
 ): Promise<Map<string, any>> {
   const enrichedMap = new Map<string, any>();
   const uniqueIds = [...new Set(companyIds.filter(Boolean))];
-  for (let i = 0; i < uniqueIds.length; i += 10) {
-    const batch = uniqueIds.slice(i, i + 10);
+
+  // Serve cache hits immediately, collect misses for API call
+  const toFetch: string[] = [];
+  for (const id of uniqueIds) {
+    const cached = companyEnrichCache.get(id);
+    if (cached && Date.now() < cached.expiresAt) {
+      enrichedMap.set(id, cached.data);
+    } else {
+      toFetch.push(id);
+    }
+  }
+
+  if (toFetch.length > 0) {
+    console.log(`[ZoomInfo MCP] Company cache: ${uniqueIds.length - toFetch.length} hits, ${toFetch.length} misses`);
+  }
+
+  for (let i = 0; i < toFetch.length; i += 10) {
+    const batch = toFetch.slice(i, i + 10);
     try {
       const result = await client.callTool({
         name: 'enrich_companies',
@@ -247,7 +269,10 @@ async function enrichCompaniesBatch(
             ? { id: entry.data.id, ...entry.data.attributes }
             : entry.data;
           const id = String(d.id || d.companyId || '');
-          if (id) enrichedMap.set(id, d);
+          if (id) {
+            enrichedMap.set(id, d);
+            companyEnrichCache.set(id, { data: d, expiresAt: Date.now() + COMPANY_CACHE_TTL_MS });
+          }
         }
       }
     } catch (err: any) {
@@ -445,10 +470,27 @@ async function callSearchAndParse(
     return [];
   }
 
+  // Pre-filter: prioritise senior contacts before enriching to save credits.
+  // search_contacts returns basic fields (jobTitle, managementLevel) without
+  // costing enrichment credits — use them to rank and cap at ENRICH_LIMIT.
+  const ENRICH_LIMIT = 15;
+  const SENIOR_LEVELS = new Set(['c-level', 'vp', 'director', 'manager', 'partner', 'owner']);
+
+  const ranked = [...searchItems].sort((a, b) => {
+    const aLevel = (a.managementLevel || '').toLowerCase();
+    const bLevel = (b.managementLevel || '').toLowerCase();
+    const aScore = SENIOR_LEVELS.has(aLevel) ? 1 : 0;
+    const bScore = SENIOR_LEVELS.has(bLevel) ? 1 : 0;
+    return bScore - aScore; // senior contacts first
+  });
+
+  const itemsToEnrich = ranked.slice(0, ENRICH_LIMIT);
+  console.log(`[ZoomInfo MCP] Enriching ${itemsToEnrich.length} of ${searchItems.length} contacts (pre-filter applied)`);
+
   // Extract personIds and companyIds for enrichment
   const personIds: string[] = [];
   const companyIds: string[] = [];
-  for (const item of searchItems) {
+  for (const item of itemsToEnrich) {
     const pid = String(item.id || item.personId || '');
     const cid = String(item.company?.id || item.companyId || '');
     if (pid) personIds.push(pid);
@@ -460,8 +502,8 @@ async function callSearchAndParse(
     companyIds.length ? enrichCompaniesBatch(client, companyIds) : Promise.resolve(new Map()),
   ]);
 
-  // Step 3: merge and map
-  const leads = searchItems.map((item: any) => {
+  // Step 3: merge and map (only over the pre-filtered set)
+  const leads = itemsToEnrich.map((item: any) => {
     const pid = String(item.id || item.personId || '');
     const cid = String(item.company?.id || item.companyId || '');
     const enrichedContact = contactEnrichedMap.get(pid) || {};
@@ -547,9 +589,11 @@ async function searchSinglePerson(
     }
   }
 
-  // Attempt 2: fullName search as fallback
+  // Attempt 2: fullName fallback — only when one of the name fields was missing
+  // (if both firstName and lastName were provided, attempt 1 already covered this)
   const fullName = `${firstName} ${lastName}`.trim();
-  if (fullName) {
+  const shouldTryFullName = fullName && !(firstName && lastName);
+  if (shouldTryFullName) {
     try {
       const result = await client.callTool({
         name: 'search_contacts',
@@ -621,8 +665,9 @@ async function lookupPeopleViaZoomInfoInternal(
     if (cid) companyIds.push(cid);
   }
 
+  const uniquePersonIds = [...new Set(personIds)];
   const [contactEnrichedMap, companyEnrichedMap] = await Promise.all([
-    personIds.length ? enrichContactsBatch(client, personIds) : Promise.resolve(new Map()),
+    uniquePersonIds.length ? enrichContactsBatch(client, uniquePersonIds) : Promise.resolve(new Map()),
     companyIds.length ? enrichCompaniesBatch(client, companyIds) : Promise.resolve(new Map()),
   ]);
 
