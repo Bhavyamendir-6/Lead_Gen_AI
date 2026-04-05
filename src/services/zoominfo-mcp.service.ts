@@ -49,96 +49,13 @@ async function getClient(): Promise<Client> {
 function resetClient() {
   mcpClient = null;
   clientToken = null;
-  validDepartmentsCache = null;
   companyEnrichCache.clear();
-}
-
-// ---------------------------------------------------------------------------
-// Department Lookup Cache
-// ---------------------------------------------------------------------------
-
-interface DeptEntry { id: string; name: string; }
-let validDepartmentsCache: DeptEntry[] | null = null;
-
-// ZoomInfo has exactly 11 departments — used as fallback if lookup fails
-const ZOOMINFO_DEPARTMENTS_FALLBACK: DeptEntry[] = [
-  { id: '0', name: 'C-Suite' },
-  { id: '1', name: 'Finance' },
-  { id: '2', name: 'Human Resources' },
-  { id: '3', name: 'Sales' },
-  { id: '4', name: 'Operations' },
-  { id: '5', name: 'Information Technology' },
-  { id: '6', name: 'Engineering & Technical' },
-  { id: '7', name: 'Marketing' },
-  { id: '8', name: 'Legal' },
-  { id: '9', name: 'Medical & Health' },
-  { id: '10', name: 'Other' },
-];
-
-async function fetchValidDepartments(client: Client): Promise<DeptEntry[]> {
-  if (validDepartmentsCache) return validDepartmentsCache;
-
-  try {
-    const result = await client.callTool({
-      name: 'lookup',
-      arguments: { fieldName: 'departments' },
-    });
-    const parsed = parseMcpResponseRaw(result);
-    // Response structure: { departments: { data: [{ id, attributes: { name } }] } }
-    const raw: any[] = parsed?.departments?.data ?? [];
-    const depts: DeptEntry[] = raw
-      .map((d: any) => ({ id: String(d.id), name: d.attributes?.name || '' }))
-      .filter(d => d.id && d.name);
-
-    if (depts.length > 0) {
-      validDepartmentsCache = depts;
-      console.log('[ZoomInfo MCP] Loaded', depts.length, 'departments from lookup');
-      return depts;
-    }
-  } catch (err: any) {
-    console.warn('[ZoomInfo MCP] Department lookup failed, using fallback:', err.message);
-  }
-
-  // Use hardcoded fallback so the filter always works
-  validDepartmentsCache = ZOOMINFO_DEPARTMENTS_FALLBACK;
-  console.log('[ZoomInfo MCP] Using hardcoded department fallback');
-  return ZOOMINFO_DEPARTMENTS_FALLBACK;
-}
-
-/** Maps caller-supplied department strings to ZoomInfo department IDs via fuzzy name match. */
-function mapToValidDepartments(input: string[], valid: DeptEntry[]): string[] {
-  if (valid.length === 0) return [];
-  const matchedIds = new Set<string>();
-  for (const dep of input) {
-    const lower = dep.toLowerCase();
-    // Exact name match first
-    const exact = valid.find(v => v.name.toLowerCase() === lower);
-    if (exact) { matchedIds.add(exact.id); continue; }
-    // Substring match
-    const partial = valid.find(
-      v => v.name.toLowerCase().includes(lower) || lower.includes(v.name.toLowerCase())
-    );
-    if (partial) matchedIds.add(partial.id);
-  }
-  return [...matchedIds];
 }
 
 // ---------------------------------------------------------------------------
 // Response Parsing Utilities
 // ---------------------------------------------------------------------------
 
-/** Lightweight parser used before the error-check version is defined. */
-function parseMcpResponseRaw(result: any): any {
-  const textContent = (result.content as any[])?.find((c: any) => c.type === 'text');
-  if (!textContent?.text) return null;
-  try {
-    let parsed = JSON.parse(textContent.text);
-    if (typeof parsed === 'string') parsed = JSON.parse(parsed);
-    return parsed;
-  } catch {
-    return null;
-  }
-}
 
 function parseMcpResponse(result: any): any {
   const textContent = (result.content as any[])?.find((c: any) => c.type === 'text');
@@ -436,89 +353,6 @@ function mapCsvRowToPartialLead(row: CsvLookupRow, reason: string): Partial<Lead
 // Search + Enrich Pipeline
 // ---------------------------------------------------------------------------
 
-async function callSearchAndParse(
-  client: Client,
-  companyName: string,
-  titles: string[],
-  filters: { location?: string; departments?: string[] }
-): Promise<Partial<Lead>[]> {
-  const baseArgs: Record<string, any> = {
-    companyName,
-    jobTitle: titles.join(' OR '),
-    pageSize: 50,
-  };
-  if (filters.location) baseArgs.country = filters.location;
-  if (filters.departments?.length) {
-    const validDepts = await fetchValidDepartments(client);
-    const mapped = mapToValidDepartments(filters.departments, validDepts);
-    if (mapped.length > 0) {
-      baseArgs.department = mapped.join(',');
-      console.log('[ZoomInfo MCP] Mapped departments:', mapped);
-    } else {
-      console.warn('[ZoomInfo MCP] No valid department matches found for:', filters.departments, '— skipping filter');
-    }
-  }
-
-  // Step 1: search_contacts
-  const searchResult = await client.callTool({ name: 'search_contacts', arguments: baseArgs });
-
-  const parsed = parseMcpResponse(searchResult);
-  const searchItems = extractDataArray(parsed);
-
-  if (searchItems.length === 0) {
-    console.log(`[ZoomInfo MCP] FOUND: 0 leads for ${companyName}`);
-    return [];
-  }
-
-  // Pre-filter: prioritise senior contacts before enriching to save credits.
-  // search_contacts returns basic fields (jobTitle, managementLevel) without
-  // costing enrichment credits — use them to rank and cap at ENRICH_LIMIT.
-  const ENRICH_LIMIT = 15;
-  const SENIOR_LEVELS = new Set(['c-level', 'vp', 'director', 'manager', 'partner', 'owner']);
-
-  const ranked = [...searchItems].sort((a, b) => {
-    const aLevel = (a.managementLevel || '').toLowerCase();
-    const bLevel = (b.managementLevel || '').toLowerCase();
-    const aScore = SENIOR_LEVELS.has(aLevel) ? 1 : 0;
-    const bScore = SENIOR_LEVELS.has(bLevel) ? 1 : 0;
-    return bScore - aScore; // senior contacts first
-  });
-
-  const itemsToEnrich = ranked.slice(0, ENRICH_LIMIT);
-  console.log(`[ZoomInfo MCP] Enriching ${itemsToEnrich.length} of ${searchItems.length} contacts (pre-filter applied)`);
-
-  // Extract personIds and companyIds for enrichment
-  const personIds: string[] = [];
-  const companyIds: string[] = [];
-  for (const item of itemsToEnrich) {
-    const pid = String(item.id || item.personId || '');
-    const cid = String(item.company?.id || item.companyId || '');
-    if (pid) personIds.push(pid);
-    if (cid) companyIds.push(cid);
-  }
-  // Step 2: enrich contacts + companies in parallel
-  const [contactEnrichedMap, companyEnrichedMap] = await Promise.all([
-    personIds.length ? enrichContactsBatch(client, personIds) : Promise.resolve(new Map()),
-    companyIds.length ? enrichCompaniesBatch(client, companyIds) : Promise.resolve(new Map()),
-  ]);
-
-  // Step 3: merge and map (only over the pre-filtered set)
-  const leads = itemsToEnrich.map((item: any) => {
-    const pid = String(item.id || item.personId || '');
-    const cid = String(item.company?.id || item.companyId || '');
-    const enrichedContact = contactEnrichedMap.get(pid) || {};
-    const enrichedCompany = companyEnrichedMap.get(cid) || null;
-    return mapToLead(item, enrichedContact, enrichedCompany, companyName);
-  });
-
-  console.log(`[ZoomInfo MCP] FOUND: ${leads.length} leads for ${companyName}`);
-  return leads;
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 // ---------------------------------------------------------------------------
 // CSV Lookup Helpers
 // ---------------------------------------------------------------------------
@@ -565,15 +399,6 @@ async function searchSinglePerson(
     companyName: row.companyName,
     pageSize: 5,
   };
-
-  // Optional department filter
-  if (row.department) {
-    try {
-      const validDepts = await fetchValidDepartments(client);
-      const mapped = mapToValidDepartments([row.department], validDepts);
-      if (mapped.length > 0) baseArgs.department = mapped.join(',');
-    } catch { /* skip dept filter on failure */ }
-  }
 
   // Attempt 1: firstName + lastName search
   if (firstName && lastName) {
@@ -704,9 +529,10 @@ async function lookupPeopleViaZoomInfoInternal(
     results.push({ row: sr.row, status: sr.status, lead, matchCount: sr.matchCount });
   }
 
-  const found = results.filter(r => r.lead).length;
+  const found = results.filter(r => r.status === 'found' || r.status === 'multiple_matches').length;
   const notFound = results.filter(r => r.status === 'not_found').length;
-  console.log(`[ZoomInfo CSV] Lookup complete: ${found} found, ${notFound} not found, ${results.length} total`);
+  const errors = results.filter(r => r.status === 'error').length;
+  console.log(`[ZoomInfo CSV] Lookup: ${found} found, ${notFound} not found, ${errors} errors out of ${results.length} rows`);
 
   return results;
 }
@@ -745,34 +571,3 @@ export async function lookupPeopleViaZoomInfo(
   }
 }
 
-export async function searchPeopleViaZoomInfo(
-  companyName: string,
-  titles: string[],
-  filters: { location?: string; departments?: string[] }
-): Promise<Partial<Lead>[]> {
-  let client: Client;
-
-  try {
-    client = await getClient();
-  } catch (err: any) {
-    console.error('[ZoomInfo MCP] Connection failed:', err.message);
-    resetClient();
-    throw new Error(`ZoomInfo MCP connection failed: ${err.message}`);
-  }
-
-  try {
-    return await callSearchAndParse(client, companyName, titles, filters);
-  } catch (err: any) {
-    console.error('[ZoomInfo MCP] Tool call failed, retrying with fresh token:', err.message);
-    resetClient();
-    clearTokenCache();
-
-    try {
-      client = await getClient();
-      return await callSearchAndParse(client, companyName, titles, filters);
-    } catch (retryErr: any) {
-      resetClient();
-      throw new Error(`ZoomInfo search failed: ${retryErr.message}`);
-    }
-  }
-}
